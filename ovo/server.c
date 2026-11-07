@@ -21,6 +21,7 @@
 #include "touch.h"
 #include "vma.h"
 #include "addr_pfn_map.h"
+#include "hwbp.h"
 
 static int ovo_release(struct socket *sock) {
 	struct sock *sk = sock->sk;
@@ -538,6 +539,36 @@ int ovo_ioctl(struct socket * sock, unsigned int cmd, unsigned long arg) {
 		}
 
 		return -2033;
+	}
+
+	if (cmd == CMD_HWBP_INSTALL) {
+		struct ovo_sock *os;
+		struct ovo_hwbp_install_args hargs;
+		int r;
+		if (!sock->sk)
+			return -EINVAL;
+		os = (struct ovo_sock *)((char *) sock->sk + sizeof(struct sock));
+		if (os->pid <= 0)
+			return -ESRCH;
+		if (copy_from_user(&hargs, (void __user *) arg, sizeof(hargs)))
+			return -EACCES;
+		r = ovo_hwbp_install(os->pid, &hargs);
+		return r ? r : -2033;
+	}
+
+	if (cmd == CMD_HWBP_UNINSTALL) {
+		struct ovo_sock *os;
+		struct ovo_hwbp_uninstall_args uargs;
+		int r;
+		if (!sock->sk)
+			return -EINVAL;
+		os = (struct ovo_sock *)((char *) sock->sk + sizeof(struct sock));
+		if (os->pid <= 0)
+			return -ESRCH;
+		if (copy_from_user(&uargs, (void __user *) arg, sizeof(uargs)))
+			return -EACCES;
+		r = ovo_hwbp_uninstall(os->pid, uargs.address);
+		return r ? r : -2033;
 	}
 
 	return -ENOTTY;
