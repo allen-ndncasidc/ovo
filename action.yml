@@ -156,7 +156,12 @@ runs:
       working-directory: android-kernel
       run: |
         repo status
-        rm common/android/abi_gki_protected_exports_* || echo "No protected exports!"
+        # Empty the protected exports lists instead of deleting them:
+        # newer branches reference these files in BUILD.bazel, so deleting breaks the build
+        for f in common/android/abi_gki_protected_exports_*; do
+          if [ -f "$f" ]; then : > "$f"; fi
+        done
+        echo "Protected exports cleared"
         git config --global user.email "bot@github.actions.org"
         git config --global user.name "github.actions"
         cd common/ && git add -A && git commit -a -m "Add Kernel Module"
