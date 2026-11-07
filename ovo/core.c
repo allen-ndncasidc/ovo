@@ -34,6 +34,7 @@
 #include "server.h"
 #include "touch.h"
 #include "addr_pfn_map.h"
+#include "hwbp.h"
 
 static int __init ovo_init(void) {
     int ret;
@@ -56,6 +57,7 @@ static int __init ovo_init(void) {
 }
 
 static void __exit ovo_exit(void) {
+    ovo_hwbp_cleanup_all();
     exit_server();
 	exit_input_dev();
 	destroy_addr_pfn_map();
