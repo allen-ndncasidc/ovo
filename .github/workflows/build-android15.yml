@@ -16,9 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - version: 6.6.57
+          - version: 6.6.98
             tag: android15-6.6
-            patch-level: 2024-12
+            patch-level: 2025-09
             arch: aarch64
           
     steps:
