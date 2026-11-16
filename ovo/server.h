@@ -34,8 +34,10 @@
 #define CMD_PROCESS_MALLOC 1008
 #define CMD_HIDE_VMA 1009
 
-#define CMD_HWBP_INSTALL   2000
-#define CMD_HWBP_UNINSTALL 2001
+#define CMD_HWBP_INSTALL      2000
+#define CMD_HWBP_UNINSTALL    2001
+#define CMD_HWBP_INSTALL_COND 2002
+#define CMD_HWBP_INSTALL_FP   2003
 
 struct req_access_process_vm {
 	pid_t from;
