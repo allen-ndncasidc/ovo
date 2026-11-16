@@ -89,7 +89,7 @@ static void ovo_hwbp_handler(struct perf_event *bp,
 	if (!n)
 		return;
 
-	// 1) 覆盖 GPR (例如 regs[1] = 0xff)
+	// 1) 覆盖 GPR (例如 regs[1] = 0xff; 或免充能 regs[0] = 1)
 	for (i = 0; i < OVO_HWBP_GPR_COUNT; i++)
 		if (n->reg_mask & (1u << i))
 			regs->regs[i] = n->reg_vals[i];
@@ -103,9 +103,10 @@ static void ovo_hwbp_handler(struct perf_event *bp,
 		if (put_user(regs->regs[30], (unsigned long __user *)new_sp) == 0)
 			regs->sp = new_sp;
 	}
-	// 其它 insn 不会到这里: 安装时已校验 insn 必须是已知可模拟的。
+	// insn == OVO_HWBP_INSN_SKIP_ONLY(0): 不模拟, 上面的 GPR 覆盖 + 下面的 PC+=4
+	//   就等于把原指令整条丢弃。安装时已校验 insn 只能是这两种之一。
 
-	// 3) 跳过被模拟的首指令, 避免原地重入
+	// 3) 跳过首指令, 避免原地重入(skip-only 时即丢弃原指令)
 	regs->pc += 4;
 }
 
@@ -173,8 +174,11 @@ int ovo_hwbp_install(pid_t target_pid, const struct ovo_hwbp_install_args *args)
 	if (ovo_hwbp_resolve())
 		return -ENOSYS;
 
-	// 只接受我们能安全模拟的首指令
-	if (args->insn != OVO_INSN_STR_X30_PRE_0x30)
+	// 只接受: (a) 能安全模拟的首指令 str x30, 或 (b) skip-only 模式(insn==0)。
+	// skip-only 命中时只覆盖 GPR 再 PC+=4, 把断点那条指令整条丢弃, 适用于
+	// 原指令只写 GPR 且写入可被丢弃的位置(免充能 cset / 命中判定 mov w0 等)。
+	if (args->insn != OVO_INSN_STR_X30_PRE_0x30 &&
+	    args->insn != OVO_HWBP_INSN_SKIP_ONLY)
 		return -EOPNOTSUPP;
 
 	mutex_lock(&ovo_hwbp_lock);
