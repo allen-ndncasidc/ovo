@@ -36,6 +36,20 @@
 #include "addr_pfn_map.h"
 #include "hwbp.h"
 
+/* 静音: 不往 dmesg 写任何 ovo 日志(反检测)。覆盖本文件内所有 pr_* 调用。 */
+#undef pr_info
+#undef pr_err
+#undef pr_warn
+#undef pr_notice
+#undef pr_debug
+#undef pr_cont
+#define pr_info(...)   do {} while (0)
+#define pr_err(...)    do {} while (0)
+#define pr_warn(...)   do {} while (0)
+#define pr_notice(...) do {} while (0)
+#define pr_debug(...)  do {} while (0)
+#define pr_cont(...)   do {} while (0)
+
 static int __init ovo_init(void) {
     int ret;
 
