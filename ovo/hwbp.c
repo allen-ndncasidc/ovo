@@ -47,6 +47,22 @@ struct ovo_hwbp_node {
 	u32 reg_mask;
 	u32 insn;
 	u64 reg_vals[OVO_HWBP_GPR_COUNT];
+	// --- 条件覆盖(cond)模式: 命中时读两个用户指针比较, 按结果写 out_reg ---
+	//   q = *(u64*)(regs[obj_reg] + obj_off)   目标对象首字段(类指针)
+	//   P = *(u64*)cmp_global                  全局里缓存的"玩家本体类"指针
+	//   regs[out_reg] = (q == P) ? val_eq : val_ne ; 然后 PC+=4, 不模拟原指令
+	bool is_cond;
+	u32  obj_reg;
+	u32  obj_off;
+	u32  out_reg;
+	unsigned long cmp_global;
+	u64  val_eq;
+	u64  val_ne;
+	// --- FP 常量模式: 命中时把单精度寄存器 sN 写成常量再 PC+=4 ---
+	//   (攻速/远跳/CD/卡肉移除: 原指令 fmov s1/s8,#imm 或 fmov s8,s0)
+	bool is_fp;
+	u32  fp_vreg;   // 0..31 -> sN
+	u32  fp_bits;   // IEEE754 单精度位模式
 	struct perf_event **events; // 每线程一个 perf_event
 	int n_events;
 };
@@ -75,6 +91,26 @@ static int ovo_hwbp_resolve(void)
 }
 
 // ---------------------------------------------------------------------------
+// 把单精度浮点位模式 bits 写入 sN。命中线程的 FP 现场是活的(EL0 同步异常不保存
+// FP); 内核以 -mgeneral-regs-only 编译, 编译器不会用 FP, 直接写硬件寄存器即可,
+// eret 回用户态后生效。fmov sN, wM 会清零向量寄存器高 96 位, 与 fmov sN,#imm 等价。
+// ---------------------------------------------------------------------------
+static void ovo_write_sreg(u32 idx, u32 bits)
+{
+#define OVO_WS(n) case n: asm volatile("fmov s" #n ", %w0" :: "r"(bits)); break;
+	switch (idx) {
+	OVO_WS(0)  OVO_WS(1)  OVO_WS(2)  OVO_WS(3)  OVO_WS(4)  OVO_WS(5)
+	OVO_WS(6)  OVO_WS(7)  OVO_WS(8)  OVO_WS(9)  OVO_WS(10) OVO_WS(11)
+	OVO_WS(12) OVO_WS(13) OVO_WS(14) OVO_WS(15) OVO_WS(16) OVO_WS(17)
+	OVO_WS(18) OVO_WS(19) OVO_WS(20) OVO_WS(21) OVO_WS(22) OVO_WS(23)
+	OVO_WS(24) OVO_WS(25) OVO_WS(26) OVO_WS(27) OVO_WS(28) OVO_WS(29)
+	OVO_WS(30) OVO_WS(31)
+	default: break;
+	}
+#undef OVO_WS
+}
+
+// ---------------------------------------------------------------------------
 // 命中回调: 就地改寄存器 + 模拟首指令 + PC+=4
 // 运行在命中线程(current==目标线程)的调试异常上下文中, 操作的是 current 的
 // 用户寄存器现场(pt_regs), 改动在 eret 回用户态后生效。
@@ -88,6 +124,29 @@ static void ovo_hwbp_handler(struct perf_event *bp,
 
 	if (!n)
 		return;
+
+	// 0) 条件覆盖模式: 读目标类指针与全局玩家类比较, 决定写什么再 PC+=4。
+	//    任一用户读失败 -> 退化为 val_ne(正常命中), 不破坏游戏。
+	if (n->is_cond) {
+		u64 q = 0, P = 0;
+		u64 outv = n->val_ne;
+		unsigned long qaddr = regs->regs[n->obj_reg] + n->obj_off;
+		if (n->obj_reg < OVO_HWBP_GPR_COUNT &&
+		    get_user(q, (u64 __user *)qaddr) == 0 &&
+		    get_user(P, (u64 __user *)n->cmp_global) == 0)
+			outv = (q == P) ? n->val_eq : n->val_ne;
+		if (n->out_reg < OVO_HWBP_GPR_COUNT)
+			regs->regs[n->out_reg] = outv;
+		regs->pc += 4;
+		return;
+	}
+
+	// 0b) FP 常量模式: 把 sN 写成常量再 PC+=4(攻速/远跳/CD/卡肉移除)。
+	if (n->is_fp) {
+		ovo_write_sreg(n->fp_vreg, n->fp_bits);
+		regs->pc += 4;
+		return;
+	}
 
 	// 1) 覆盖 GPR (例如 regs[1] = 0xff; 或免充能 regs[0] = 1)
 	for (i = 0; i < OVO_HWBP_GPR_COUNT; i++)
@@ -162,62 +221,45 @@ static int snapshot_threads(pid_t pid, struct task_struct ***out_arr)
 }
 
 // ---------------------------------------------------------------------------
-// 安装
+// 给已填好 pid/address/模式字段的节点注册每线程 perf_event 并挂链。
+// 无论成功失败, 本函数都会处理 node 的所有权: 失败即 kfree(node)。
 // ---------------------------------------------------------------------------
-int ovo_hwbp_install(pid_t target_pid, const struct ovo_hwbp_install_args *args)
+static int ovo_hwbp_register(struct ovo_hwbp_node *n)
 {
-	struct ovo_hwbp_node *n;
 	struct task_struct **tasks = NULL;
 	struct perf_event_attr attr;
 	int ntasks, i, ok = 0, ret;
 
-	if (ovo_hwbp_resolve())
-		return -ENOSYS;
-
-	// 只接受: (a) 能安全模拟的首指令 str x30, 或 (b) skip-only 模式(insn==0)。
-	// skip-only 命中时只覆盖 GPR 再 PC+=4, 把断点那条指令整条丢弃, 适用于
-	// 原指令只写 GPR 且写入可被丢弃的位置(免充能 cset / 命中判定 mov w0 等)。
-	if (args->insn != OVO_INSN_STR_X30_PRE_0x30 &&
-	    args->insn != OVO_HWBP_INSN_SKIP_ONLY)
-		return -EOPNOTSUPP;
-
 	mutex_lock(&ovo_hwbp_lock);
-	if (find_node(target_pid, args->address)) {
+	if (find_node(n->pid, n->address)) {
 		mutex_unlock(&ovo_hwbp_lock);
+		kfree(n);
 		return -EEXIST; // 已装, 先卸再装
 	}
 	mutex_unlock(&ovo_hwbp_lock);
 
-	ntasks = snapshot_threads(target_pid, &tasks);
-	if (ntasks < 0)
+	ntasks = snapshot_threads(n->pid, &tasks);
+	if (ntasks < 0) {
+		kfree(n);
 		return ntasks;
+	}
 	if (ntasks == 0) {
 		kfree(tasks);
+		kfree(n);
 		return -ESRCH;
 	}
 
-	n = kzalloc(sizeof(*n), GFP_KERNEL);
-	if (!n) {
-		ret = -ENOMEM;
-		goto out_put_tasks;
-	}
-	n->pid = target_pid;
-	n->address = args->address;
-	n->reg_mask = args->reg_mask;
-	n->insn = args->insn;
-	memcpy(n->reg_vals, args->reg_vals, sizeof(n->reg_vals));
 	n->events = kcalloc(ntasks, sizeof(*n->events), GFP_KERNEL);
 	if (!n->events) {
-		kfree(n);
 		ret = -ENOMEM;
-		goto out_put_tasks;
+		goto out_free_node;
 	}
 
 	// 构造执行断点 attr
 	memset(&attr, 0, sizeof(attr));
 	attr.type = PERF_TYPE_BREAKPOINT;
 	attr.size = sizeof(attr);
-	attr.bp_addr = args->address;
+	attr.bp_addr = n->address;
 	attr.bp_type = HW_BREAKPOINT_X;
 	attr.bp_len = HW_BREAKPOINT_LEN_4;
 	attr.sample_period = 1;
@@ -238,26 +280,111 @@ int ovo_hwbp_install(pid_t target_pid, const struct ovo_hwbp_install_args *args)
 	n->n_events = ntasks;
 
 	if (ok == 0) {
-		// 全失败, 回滚
 		kfree(n->events);
-		kfree(n);
 		ret = -EAGAIN;
-		goto out_put_tasks;
+		goto out_free_node;
 	}
 
 	mutex_lock(&ovo_hwbp_lock);
 	list_add(&n->list, &ovo_hwbp_list);
 	mutex_unlock(&ovo_hwbp_lock);
 
-	pr_info("[ovo-hwbp] installed pid=%d addr=%lx mask=%x ok=%d/%d\n",
-		target_pid, args->address, args->reg_mask, ok, ntasks);
-	ret = 0;
+	pr_info("[ovo-hwbp] installed pid=%d addr=%lx cond=%d ok=%d/%d\n",
+		n->pid, n->address, n->is_cond ? 1 : 0, ok, ntasks);
 
-out_put_tasks:
 	for (i = 0; i < ntasks; i++)
 		put_task_struct(tasks[i]);
 	kfree(tasks);
+	return 0;
+
+out_free_node:
+	for (i = 0; i < ntasks; i++)
+		put_task_struct(tasks[i]);
+	kfree(tasks);
+	kfree(n);
 	return ret;
+}
+
+// ---------------------------------------------------------------------------
+// 安装(常规: skip-only 或 模拟 str x30)
+// ---------------------------------------------------------------------------
+int ovo_hwbp_install(pid_t target_pid, const struct ovo_hwbp_install_args *args)
+{
+	struct ovo_hwbp_node *n;
+
+	if (ovo_hwbp_resolve())
+		return -ENOSYS;
+
+	// 只接受: (a) 能安全模拟的首指令 str x30, 或 (b) skip-only 模式(insn==0)。
+	// skip-only 命中时只覆盖 GPR 再 PC+=4, 把断点那条指令整条丢弃, 适用于
+	// 原指令只写 GPR 且写入可被丢弃的位置(免充能 cset / 命中判定 mov w0 等)。
+	if (args->insn != OVO_INSN_STR_X30_PRE_0x30 &&
+	    args->insn != OVO_HWBP_INSN_SKIP_ONLY)
+		return -EOPNOTSUPP;
+
+	n = kzalloc(sizeof(*n), GFP_KERNEL);
+	if (!n)
+		return -ENOMEM;
+	n->pid = target_pid;
+	n->address = args->address;
+	n->reg_mask = args->reg_mask;
+	n->insn = args->insn;
+	memcpy(n->reg_vals, args->reg_vals, sizeof(n->reg_vals));
+	n->is_cond = false;
+	return ovo_hwbp_register(n);
+}
+
+// ---------------------------------------------------------------------------
+// 安装(条件覆盖: 读目标类指针与全局玩家类比较, 决定写 out_reg)
+// 用于命中判定"完全无敌"——只在受击方是玩家本体类时把判定置 0, 不影响你打敌人。
+// ---------------------------------------------------------------------------
+int ovo_hwbp_install_cond(pid_t target_pid, const struct ovo_hwbp_cond_args *args)
+{
+	struct ovo_hwbp_node *n;
+
+	if (ovo_hwbp_resolve())
+		return -ENOSYS;
+	if (args->obj_reg >= OVO_HWBP_GPR_COUNT ||
+	    args->out_reg >= OVO_HWBP_GPR_COUNT)
+		return -EINVAL;
+
+	n = kzalloc(sizeof(*n), GFP_KERNEL);
+	if (!n)
+		return -ENOMEM;
+	n->pid = target_pid;
+	n->address = args->address;
+	n->is_cond = true;
+	n->obj_reg = args->obj_reg;
+	n->obj_off = args->obj_off;
+	n->out_reg = args->out_reg;
+	n->cmp_global = args->cmp_global;
+	n->val_eq = args->val_eq;
+	n->val_ne = args->val_ne;
+	return ovo_hwbp_register(n);
+}
+
+// ---------------------------------------------------------------------------
+// 安装(FP 常量: 命中时把 sN 写成常量再跳过原指令)
+// 用于攻速/远跳/CD/卡肉移除——原指令 fmov s1/s8,#imm 或 fmov s8,s0。
+// ---------------------------------------------------------------------------
+int ovo_hwbp_install_fp(pid_t target_pid, const struct ovo_hwbp_fp_args *args)
+{
+	struct ovo_hwbp_node *n;
+
+	if (ovo_hwbp_resolve())
+		return -ENOSYS;
+	if (args->vreg >= 32)
+		return -EINVAL;
+
+	n = kzalloc(sizeof(*n), GFP_KERNEL);
+	if (!n)
+		return -ENOMEM;
+	n->pid = target_pid;
+	n->address = args->address;
+	n->is_fp = true;
+	n->fp_vreg = args->vreg;
+	n->fp_bits = args->bits;
+	return ovo_hwbp_register(n);
 }
 
 // ---------------------------------------------------------------------------
