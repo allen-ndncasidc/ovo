@@ -82,11 +82,8 @@ static int ovo_hwbp_resolve(void)
 		p_unregister_hw_breakpoint = (unreg_hwbp_fn)(void *)
 			ovo_kallsyms_lookup_name("unregister_hw_breakpoint");
 
-	if (!p_register_user_hw_breakpoint || !p_unregister_hw_breakpoint) {
-		pr_err("[ovo-hwbp] resolve failed: reg=%d unreg=%d\n",
-		       !!p_register_user_hw_breakpoint, !!p_unregister_hw_breakpoint);
+	if (!p_register_user_hw_breakpoint || !p_unregister_hw_breakpoint)
 		return -ENOSYS;
-	}
 	return 0;
 }
 
@@ -275,8 +272,6 @@ static int ovo_hwbp_register(struct ovo_hwbp_node *n)
 			&attr, ovo_hwbp_handler, n, tasks[i]);
 		if (IS_ERR(ev)) {
 			n->events[i] = NULL;
-			pr_warn("[ovo-hwbp] reg fail tid=%d err=%ld\n",
-				tasks[i]->pid, PTR_ERR(ev));
 		} else {
 			n->events[i] = ev;
 			ok++;
@@ -293,9 +288,6 @@ static int ovo_hwbp_register(struct ovo_hwbp_node *n)
 	mutex_lock(&ovo_hwbp_lock);
 	list_add(&n->list, &ovo_hwbp_list);
 	mutex_unlock(&ovo_hwbp_lock);
-
-	pr_info("[ovo-hwbp] installed pid=%d addr=%lx cond=%d ok=%d/%d\n",
-		n->pid, n->address, n->is_cond ? 1 : 0, ok, ntasks);
 
 	for (i = 0; i < ntasks; i++)
 		put_task_struct(tasks[i]);
@@ -422,7 +414,6 @@ int ovo_hwbp_uninstall(pid_t target_pid, unsigned long address)
 
 	free_node_events(n);
 	kfree(n);
-	pr_info("[ovo-hwbp] uninstalled pid=%d addr=%lx\n", target_pid, address);
 	return 0;
 }
 
