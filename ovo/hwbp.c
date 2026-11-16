@@ -97,7 +97,12 @@ static int ovo_hwbp_resolve(void)
 // ---------------------------------------------------------------------------
 static void ovo_write_sreg(u32 idx, u32 bits)
 {
-#define OVO_WS(n) case n: asm volatile("fmov s" #n ", %w0" :: "r"(bits)); break;
+	// 内核以 -mgeneral-regs-only 编译, 汇编器会拒绝 fmov 助记符(instruction
+	// requires: fp-armv8)。改用 .inst 直接发原始指令字, 绕过该特性门。
+	// fmov sD, w9 = 0x1E270120 | D (Rn 固定为 w9); 把 bits 钉在 w9。
+	register unsigned int v asm("w9") = bits;
+#define OVO_WS(n) case n: \
+	asm volatile(".inst %c0" : : "i"(0x1E270120u | (unsigned)(n)), "r"(v)); break;
 	switch (idx) {
 	OVO_WS(0)  OVO_WS(1)  OVO_WS(2)  OVO_WS(3)  OVO_WS(4)  OVO_WS(5)
 	OVO_WS(6)  OVO_WS(7)  OVO_WS(8)  OVO_WS(9)  OVO_WS(10) OVO_WS(11)
