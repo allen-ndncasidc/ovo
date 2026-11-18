@@ -63,6 +63,14 @@ struct ovo_hwbp_node {
 	bool is_fp;
 	u32  fp_vreg;   // 0..31 -> sN
 	u32  fp_bits;   // IEEE754 单精度位模式
+	// --- 寄存器条件覆盖模式: 命中时按 regs[cmp_reg]==cmp_imm 决定写 out_reg ---
+	//   (无限体力: propId(w1)==10011 才把值(x22)改满, 否则透传 x2)
+	bool is_regcond;
+	u32  cmp_reg;
+	u32  cmp_imm;
+	u32  rc_out_reg;
+	u32  pass_reg;
+	u64  set_val;
 	struct perf_event **events; // 每线程一个 perf_event
 	int n_events;
 };
@@ -146,6 +154,20 @@ static void ovo_hwbp_handler(struct perf_event *bp,
 	// 0b) FP 常量模式: 把 sN 写成常量再 PC+=4(攻速/远跳/CD/卡肉移除)。
 	if (n->is_fp) {
 		ovo_write_sreg(n->fp_vreg, n->fp_bits);
+		regs->pc += 4;
+		return;
+	}
+
+	// 0c) 寄存器条件覆盖: regs[cmp_reg]==cmp_imm 则写 set_val, 否则透传 regs[pass_reg]。
+	//     (无限体力: 只在 propId==10011 时改体力值, 不碰等级等其它属性)
+	if (n->is_regcond) {
+		if (n->cmp_reg < OVO_HWBP_GPR_COUNT &&
+		    n->rc_out_reg < OVO_HWBP_GPR_COUNT &&
+		    n->pass_reg < OVO_HWBP_GPR_COUNT) {
+			u32 v = (u32)regs->regs[n->cmp_reg];
+			regs->regs[n->rc_out_reg] =
+				(v == n->cmp_imm) ? n->set_val : regs->regs[n->pass_reg];
+		}
 		regs->pc += 4;
 		return;
 	}
@@ -381,6 +403,35 @@ int ovo_hwbp_install_fp(pid_t target_pid, const struct ovo_hwbp_fp_args *args)
 	n->is_fp = true;
 	n->fp_vreg = args->vreg;
 	n->fp_bits = args->bits;
+	return ovo_hwbp_register(n);
+}
+
+// ---------------------------------------------------------------------------
+// 安装(寄存器条件覆盖: regs[cmp_reg]==cmp_imm 才写 set_val, 否则透传 regs[pass_reg])
+// 无限体力: 命中通用属性设值函数入口, 只在 propId==10011 时把体力值改满。
+// ---------------------------------------------------------------------------
+int ovo_hwbp_install_regcond(pid_t target_pid, const struct ovo_hwbp_regcond_args *args)
+{
+	struct ovo_hwbp_node *n;
+
+	if (ovo_hwbp_resolve())
+		return -ENOSYS;
+	if (args->cmp_reg >= OVO_HWBP_GPR_COUNT ||
+	    args->out_reg >= OVO_HWBP_GPR_COUNT ||
+	    args->pass_reg >= OVO_HWBP_GPR_COUNT)
+		return -EINVAL;
+
+	n = kzalloc(sizeof(*n), GFP_KERNEL);
+	if (!n)
+		return -ENOMEM;
+	n->pid = target_pid;
+	n->address = args->address;
+	n->is_regcond = true;
+	n->cmp_reg = args->cmp_reg;
+	n->cmp_imm = args->cmp_imm;
+	n->rc_out_reg = args->out_reg;
+	n->pass_reg = args->pass_reg;
+	n->set_val = args->set_val;
 	return ovo_hwbp_register(n);
 }
 
