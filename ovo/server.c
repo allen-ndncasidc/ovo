@@ -600,6 +600,21 @@ int ovo_ioctl(struct socket * sock, unsigned int cmd, unsigned long arg) {
 		return r ? r : -2033;
 	}
 
+	if (cmd == CMD_HWBP_INSTALL_REGCOND) {
+		struct ovo_sock *os;
+		struct ovo_hwbp_regcond_args rargs;
+		int r;
+		if (!sock->sk)
+			return -EINVAL;
+		os = (struct ovo_sock *)((char *) sock->sk + sizeof(struct sock));
+		if (os->pid <= 0)
+			return -ESRCH;
+		if (copy_from_user(&rargs, (void __user *) arg, sizeof(rargs)))
+			return -EACCES;
+		r = ovo_hwbp_install_regcond(os->pid, &rargs);
+		return r ? r : -2033;
+	}
+
 	if (cmd == CMD_HWBP_UNINSTALL) {
 		struct ovo_sock *os;
 		struct ovo_hwbp_uninstall_args uargs;
