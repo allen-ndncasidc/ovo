@@ -74,10 +74,27 @@ struct ovo_hwbp_fp_args {
 	__u32 bits;                            // IEEE754 单精度位模式
 };
 
+// 寄存器条件覆盖模式(无限体力用)。命中时:
+//   u32 v = (u32)regs[cmp_reg];
+//   regs[out_reg] = (v == cmp_imm) ? set_val : regs[pass_reg];
+//   PC += 4; 不模拟原指令。
+// 用于通用"按属性ID设值"函数入口 mov x22,x2:
+//   只有 propId(w1==cmp_reg=1) == 10011(当前耐力) 时才把值(x22=out_reg)改成满值,
+//   否则透传原值(x22 = x2 = pass_reg), 不影响等级等其它属性。
+struct ovo_hwbp_regcond_args {
+	unsigned long address;                 // 断点绝对运行时地址
+	__u32 cmp_reg;                         // 拿来比较的 GPR 下标(propId 在 w1 -> 1)
+	__u32 cmp_imm;                         // 比较的立即数(10011 = 0x271B)
+	__u32 out_reg;                         // 要写的 GPR 下标(x22 -> 22)
+	__u32 pass_reg;                        // 不等时透传来源 GPR 下标(x2 -> 2)
+	__u64 set_val;                         // 相等时写入 out_reg 的值(体力*100)
+};
+
 // 由 ovo_ioctl 调用; target_pid = os->pid
 int ovo_hwbp_install(pid_t target_pid, const struct ovo_hwbp_install_args *args);
 int ovo_hwbp_install_cond(pid_t target_pid, const struct ovo_hwbp_cond_args *args);
 int ovo_hwbp_install_fp(pid_t target_pid, const struct ovo_hwbp_fp_args *args);
+int ovo_hwbp_install_regcond(pid_t target_pid, const struct ovo_hwbp_regcond_args *args);
 int ovo_hwbp_uninstall(pid_t target_pid, unsigned long address);
 
 // 模块卸载时清理所有断点
